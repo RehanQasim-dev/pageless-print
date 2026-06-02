@@ -41,9 +41,18 @@ on-screen styling, colors and layout preserved.
   truly overlay positioned, and de-floats fixed elements so nothing hovers over
   the page. Matching is tight to avoid false positives, a content element is
   never removed, and every removal is logged
-- Self verifying. It checks page count and trailing blank in process then
-  binary searches the tightest single page height and re renders so the output
-  file always matches the reported metrics
+- Optional paged output for editors and fast scrolling. A single very tall page
+  renders blurry and slow in viewers past about 200 inches, so these modes split
+  the content into pages that render crisply, never splitting a diagram, table,
+  code block or paragraph across a break
+  - `--paged` chooses the page height that wastes the least blank at the breaks,
+    keeping pages as large as possible, and trims the last page to its content
+  - `--paged2` keeps every page the same height and chooses the height that
+    minimizes blank summed over all pages, packing content evenly into uniform
+    pages
+- Fits the single page to content by rendering one tall page and cropping it to
+  the content bounding box top and bottom, so pages whose content is offset or
+  centered still fit tightly with no blank band
 
 ## Setup
 
@@ -55,13 +64,20 @@ playwright install chromium
 ## Usage
 
 ```bash
-python pageless_pdf.py <url> [output.pdf] [--zoom N] [--font-scale N] [--dark] [--declutter]
+python pageless_pdf.py <url> [output.pdf] [--zoom N] [--font-scale N] [--paged] [--paged2] [--dark] [--declutter]
 ```
 
 Example
 
 ```bash
 python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf
+```
+
+Paged output for PDF editors and fast scrolling
+
+```bash
+python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --paged
+python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --paged2
 ```
 
 Soft dark mode

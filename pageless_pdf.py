@@ -8,7 +8,12 @@ Usage:
     --zoom N        browser-style zoom as a percent, e.g. --zoom 150 (like Ctrl+ in a browser)
     --font-scale N  multiply only text size, e.g. --font-scale 1.4
     --paged         split into several large pages that render fast in viewers
-                    (default is one tall pageless page). Blocks are never split.
+                    (default is one tall pageless page). Blocks are never split;
+                    page height is chosen to minimize blank at the breaks and the
+                    last page is trimmed to its content.
+    --paged2        like --paged but every page is the SAME height (last page not
+                    trimmed); the height is chosen to minimize blank summed over
+                    ALL pages, packing content evenly into uniform pages.
 
 The desktop layout width is auto-detected from the display so the PDF page comes
 out the same width as a maximized Firefox/Chrome window on this machine.
@@ -632,6 +637,24 @@ def measure_paged_blank(out_path):
     return total, pages
 
 
+def measure_all_blank(out_path):
+    """Total bottom blank across EVERY page including the last (points).
+
+    Used by --paged2, which keeps pages a uniform size (no last-page trim) and
+    so must count the final page's trailing blank too. Uses the strip-scanning
+    content bottom so a nearly-empty last page (blank far taller than one strip)
+    is measured correctly. Returns (total_blank_pt, page_count).
+    """
+    doc = fitz.open(out_path)
+    pages = doc.page_count
+    total = 0.0
+    for i in range(pages):
+        p = doc[i]
+        total += max(0.0, p.rect.height - content_bottom_pt(p))
+    doc.close()
+    return total, pages
+
+
 def content_bottom_pt(page, zoom=0.5, strip_pt=4000.0):
     """Y of the lowest non-background row on a page, in points from the top.
 
@@ -836,7 +859,7 @@ def detect_browser_width():
 
 
 def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0,
-            base_width=VIEWPORT_WIDTH, paged=False):
+            base_width=VIEWPORT_WIDTH, paged=False, paged2=False):
     # Browser-style zoom: lay the page out at a narrower width (base / zoom) so
     # it reflows, then magnify that layout by `zoom` when emitting (see the
     # render_scale logic below). Text, images, and spacing all grow together and
@@ -1025,6 +1048,71 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0
                 f"bottom may not fit on one page.")
             content_h = float(MAX_PAGE_HEIGHT_PX)
 
+        in_per_px = CSS_TO_PT / 72.0   # px -> inches (shared by paged modes)
+
+        # --- paged2 mode: uniform pages, minimal TOTAL blank ----------------
+        # Like --paged, but every page is the SAME height (the last page is not
+        # trimmed) and the objective counts the last page's trailing blank too.
+        # We search uniform heights that split the content into N nearly-full
+        # pages and pick the one with the least blank summed over ALL pages.
+        if paged2:
+            log("[4/4] Generating paged PDF (uniform pages, least total blank)")
+            try:
+                page.add_style_tag(content=NO_BREAK_CSS)
+            except Exception as e:
+                log(f"      (no-break css note: {e})")
+            cap = float(PAGED_MAX_PAGE_PX)
+
+            if content_h <= cap:
+                # Fits under the cap: one page, cropped to content (like default).
+                margin = max(800.0, content_h * 0.06)
+                render_pdf(page, paper_w, min(content_h + margin, cap),
+                           out_path, scale=render_scale)
+                removed_pt = crop_to_content(out_path)
+                log(f"   content fits the cap -> 1 page, cropped to content "
+                    f"(removed {removed_pt / 72.0:.1f} in)")
+                total_blank_pt = 0.0
+            else:
+                # Candidate uniform heights = content / N (a hair larger so a
+                # block pushed by break-avoidance still fits in N pages instead
+                # of spilling to N+1). N grows until pages would get too small.
+                Nmin = max(2, math.ceil(content_h / cap))
+                min_h = max(cap * 0.30, 2880.0)
+                cands = []
+                N = Nmin
+                while content_h / N >= min_h and N <= Nmin + 7:
+                    cands.append(int(min(cap, round(content_h / N * 1.03))))
+                    N += 1
+                cands = sorted(set(cands), reverse=True)
+                TOL_PT = 200.0   # blanks within ~3in are a tie -> prefer bigger pages
+                best = None       # (key, h, pages, total_blank_pt)
+                for h in cands:
+                    render_pdf(page, paper_w, float(h), out_path, scale=render_scale)
+                    total_blank_pt, pages = measure_all_blank(out_path)
+                    log(f"   try {h}px ({h * in_per_px:.0f} in): {pages} pages, "
+                        f"total blank {total_blank_pt / 72.0:.1f} in")
+                    key = (round(total_blank_pt / TOL_PT), -h)
+                    if best is None or key < best[0]:
+                        best = (key, float(h), pages, total_blank_pt)
+                page_h, _, total_blank_pt = best[1], best[2], best[3]
+                render_pdf(page, paper_w, page_h, out_path, scale=render_scale)
+                log(f"   -> chosen {page_h:.0f}px ({page_h * in_per_px:.0f} in) "
+                    f"uniform page, least total blank {total_blank_pt / 72.0:.1f} in")
+
+            # Uniform pages: deliberately NO trimming, so every page is identical.
+            finalize_pdf(out_path)
+            doc = fitz.open(out_path)
+            pages = doc.page_count
+            page_h_pt = doc[0].rect.height
+            doc.close()
+            log(f"   -> {pages} page(s) of {page_h_pt / 72.0:.1f} in each (uniform)")
+            ctx.close()
+            browser.close()
+            m = {"pages": pages, "blank_css": 0.0, "blank_pct": 0.0,
+                 "page_h_pt": page_h_pt, "saturated": False, "paged": True,
+                 "uniform": True, "wasted_blank_in": total_blank_pt / 72.0}
+            return (page_h_pt / CSS_TO_PT, m)
+
         # --- paged mode -----------------------------------------------------
         # Instead of one giant page (which viewers rasterise blurry + slowly
         # past ~200in), split the content into pages that render crisply, never
@@ -1040,7 +1128,6 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0
             except Exception as e:
                 log(f"      (no-break css note: {e})")
             cap = float(PAGED_MAX_PAGE_PX)
-            in_per_px = CSS_TO_PT / 72.0   # px -> inches
 
             if content_h <= cap:
                 # Fits under the cap: one page, no breaks, nothing wasted.
@@ -1100,7 +1187,7 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0
             m = {"pages": pages, "blank_css": 0.0, "blank_pct": 0.0,
                  "page_h_pt": page_h_pt, "saturated": False, "paged": True,
                  "wasted_blank_in": waste_pt / 72.0, "last_page_in": last_h_pt / 72.0}
-            return (page_h, m)
+            return (page_h_pt / CSS_TO_PT, m)
 
         log("[4/4] Generating single page, then trimming to content")
 
@@ -1170,6 +1257,11 @@ def main():
         while flag in args:
             paged = True
             args.remove(flag)
+    paged2 = False
+    for flag in ("--paged2",):
+        while flag in args:
+            paged2 = True
+            args.remove(flag)
 
     # Value flags: --font-scale N (multiplier) and --zoom N (percent, e.g. 150).
     def take_value(names):
@@ -1211,17 +1303,21 @@ def main():
 
     height_css, m = convert(url, out_path, dark=dark, declutter=declutter,
                             font_scale=font_scale, zoom=zoom, base_width=base_width,
-                            paged=paged)
+                            paged=paged, paged2=paged2)
 
     print("\n=== RESULT ==================================================")
     print(f"  Output file      : {out_path}")
     print(f"  PDF pages        : {m['pages']}")
     if m.get("paged"):
-        print(f"  Mode             : paged (viewer-friendly, blocks kept whole)")
+        if m.get("uniform"):
+            print(f"  Mode             : paged (uniform pages, least total blank)")
+            blank_note = "across all pages, minimized"
+        else:
+            print(f"  Mode             : paged (viewer-friendly, blocks kept whole)")
+            blank_note = "at page breaks, last page trimmed"
         print(f"  Page height      : {height_css:.1f} CSS px  "
               f"({m['page_h_pt']:.1f} pt / {m['page_h_pt']/72:.1f} in)")
-        print(f"  Wasted blank     : {m.get('wasted_blank_in', 0.0):.1f} in "
-              f"(at page breaks, minimized)")
+        print(f"  Wasted blank     : {m.get('wasted_blank_in', 0.0):.1f} in ({blank_note})")
         print(f"  Selectable text  : yes (Chromium print-to-PDF)")
         ok = m["pages"] >= 1
         print(f"  Status           : {'PASS' if ok else 'CHECK — see log above'}")
