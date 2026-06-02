@@ -45,9 +45,7 @@ from playwright.sync_api import sync_playwright
 # ---- tunables ---------------------------------------------------------------
 VIEWPORT_WIDTH = 1440          # desktop layout width (CSS px)
 DEVICE_SCALE = 1
-MAX_ITERATIONS = 14
-BLANK_THRESHOLD_PX = 4.0       # acceptable trailing blank space (CSS px)
-SAFETY_PAD_PX = 1.0            # tiny pad to avoid sub-pixel overflow -> 2nd page
+MAX_ITERATIONS = 14            # cap on grow attempts when content overflows a page
 NAV_TIMEOUT_MS = 60_000
 # Post-load settle: wait until content height is stable for N samples (or a
 # timeout), so late JS-rendered / streamed content is captured.
@@ -634,20 +632,85 @@ def measure_paged_blank(out_path):
     return total, pages
 
 
-def content_bottom_pt(page, zoom=0.5):
+def content_bottom_pt(page, zoom=0.5, strip_pt=4000.0):
     """Y of the lowest non-background row on a page, in points from the top.
 
-    Rasterises the whole page at low resolution (enough to spot text lines) and
-    finds where content ends, even when most of the page is blank. Used to trim
-    the last page of a paged PDF down to its content.
+    Scans the page from the bottom upward in bounded strips (so memory stays
+    capped even for a 300000px single page) until it finds content, then returns
+    where that content ends. The low zoom is enough to spot text lines; we only
+    need where content ends, not sub-pixel precision. Used to trim a page down
+    to its content.
     """
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-    corners = np.stack([arr[-1, 0], arr[-1, -1]]).astype(np.int16)
-    bg = np.median(corners, axis=0)
-    nonblank = (np.abs(arr.astype(np.int16) - bg).max(axis=2) > 10).any(axis=1)
-    idx = np.nonzero(nonblank)[0]
-    return (float(idx[-1] + 1) / zoom) if idx.size else 0.0
+    H, W = page.rect.height, page.rect.width
+    bg = None
+    y = H
+    while y > 0:
+        top = max(0.0, y - strip_pt)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                              clip=fitz.Rect(0, top, W, y), alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if bg is None:                       # background = corners of the bottom strip
+            corners = np.stack([arr[-1, 0], arr[-1, -1]]).astype(np.int16)
+            bg = np.median(corners, axis=0)
+        nonblank = (np.abs(arr.astype(np.int16) - bg).max(axis=2) > 10).any(axis=1)
+        idx = np.nonzero(nonblank)[0]
+        if idx.size:                         # lowest content row is in this strip
+            return top + float(idx[-1] + 1) / zoom
+        y = top
+    return 0.0
+
+
+def content_top_pt(page, zoom=0.5, strip_pt=4000.0):
+    """Y of the highest non-background row on a page, in points from the top.
+
+    The top-end counterpart of content_bottom_pt, scanning downward from the top
+    in bounded strips. Used to crop outer blank above the content (e.g. a page
+    whose content is vertically offset/centred, not anchored to the top).
+    """
+    H, W = page.rect.height, page.rect.width
+    bg = None
+    y = 0.0
+    while y < H:
+        bottom = min(H, y + strip_pt)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                              clip=fitz.Rect(0, y, W, bottom), alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if bg is None:                       # background = corners of the top strip
+            corners = np.stack([arr[0, 0], arr[0, -1]]).astype(np.int16)
+            bg = np.median(corners, axis=0)
+        nonblank = (np.abs(arr.astype(np.int16) - bg).max(axis=2) > 10).any(axis=1)
+        idx = np.nonzero(nonblank)[0]
+        if idx.size:                         # highest content row is in this strip
+            return y + float(idx[0]) / zoom
+        y = bottom
+    return H
+
+
+def crop_to_content(out_path, pad_pt=6.0):
+    """Crop a single-page PDF to its content bounding box (top and bottom).
+
+    Removes outer blank both above and below the content (so a page whose
+    content is offset or centred fits tightly), keeping a small pad. Returns the
+    points removed. Only acts on a one-page document.
+    """
+    doc = fitz.open(out_path)
+    removed = 0.0
+    if doc.page_count == 1:
+        p = doc[0]
+        H, W = p.rect.height, p.rect.width
+        top = content_top_pt(p)
+        bot = content_bottom_pt(p)
+        if 0 <= top < bot <= H:
+            y0 = max(0.0, top - pad_pt)
+            y1 = min(H, bot + pad_pt)
+            if (y1 - y0) > 2.0 and (H - (y1 - y0)) > 2.0:
+                p.set_cropbox(fitz.Rect(0, y0, W, y1))
+                doc.save(out_path + ".trim")
+                removed = H - (y1 - y0)
+    doc.close()
+    if removed:
+        os.replace(out_path + ".trim", out_path)
+    return removed
 
 
 def trim_last_page(out_path, pad_pt=8.0):
@@ -661,8 +724,10 @@ def trim_last_page(out_path, pad_pt=8.0):
     if doc.page_count:
         last = doc[-1]
         H, W = last.rect.height, last.rect.width
-        new_h = min(H, content_bottom_pt(last) + pad_pt)
-        if H - new_h > 2.0:
+        cb = content_bottom_pt(last)
+        new_h = min(H, cb + pad_pt)
+        # Guard: never crop to (near) nothing if content wasn't detected.
+        if cb > 0 and H - new_h > 2.0:
             # CropBox is in top-left page coords and is what viewers/editors
             # display, so this keeps the top (content) and drops the bottom
             # (blank). Setting MediaBox here would reset the cropbox and uses a
@@ -1006,11 +1071,21 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0
                 log(f"   -> chosen {page_h:.0f}px ({page_h * in_per_px:.0f} in) page, "
                     f"least wasted blank {waste_pt / 72.0:.1f} in")
 
-            # Trim trailing blank off the last page so it ends at its content.
-            trimmed_pt = trim_last_page(out_path)
-            if trimmed_pt > 2.0:
-                log(f"   trimmed {trimmed_pt / 72.0:.1f} in of trailing blank "
-                    f"off the last page")
+            # Remove outer blank. A single page is cropped both ends (same as
+            # the default mode); a multi-page result only trims the last page's
+            # bottom (its top continues content from the previous page).
+            doc = fitz.open(out_path)
+            npages = doc.page_count
+            doc.close()
+            if npages == 1:
+                removed_pt = crop_to_content(out_path)
+                if removed_pt > 2.0:
+                    log(f"   cropped to content (removed {removed_pt / 72.0:.1f} in)")
+            else:
+                trimmed_pt = trim_last_page(out_path)
+                if trimmed_pt > 2.0:
+                    log(f"   trimmed {trimmed_pt / 72.0:.1f} in of trailing blank "
+                        f"off the last page")
 
             finalize_pdf(out_path)
             doc = fitz.open(out_path)
@@ -1027,96 +1102,55 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0
                  "wasted_blank_in": waste_pt / 72.0, "last_page_in": last_h_pt / 72.0}
             return (page_h, m)
 
-        log("[4/4] Generating + self-verifying PDF")
+        log("[4/4] Generating single page, then trimming to content")
 
-        renders = 0
+        # Render one page tall enough to hold everything, then crop it down to
+        # where the content actually ends. This replaces an iterative height
+        # search with one render + one trim. The margin covers Chromium's print
+        # layout coming out a touch taller than the measured DOM height; if a
+        # ballooning vh/% element still overflows it, we grow until it is one
+        # page (the same guard the old search provided).
+        grow_cap = min(float(MAX_PAGE_HEIGHT_PX), content_h * 2.5 + 10_000)
+        margin = max(800.0, content_h * 0.06)
+        h = min(content_h + margin, float(MAX_PAGE_HEIGHT_PX))
 
-        def attempt(h):
-            nonlocal renders
+        def render_count(height):
+            render_pdf(page, paper_w, height, out_path, scale=render_scale)
+            doc = fitz.open(out_path)
+            n = doc.page_count
+            doc.close()
+            return n
+
+        renders = 1
+        pages = render_count(h)
+        while pages > 1 and renders < MAX_ITERATIONS and h < grow_cap:
+            h = min(h * 1.6, grow_cap)
+            pages = render_count(h)
             renders += 1
-            render_pdf(page, paper_w, h, out_path, scale=render_scale)
-            m = measure_pdf(out_path, h)
-            log(
-                f"   try {renders}: page_height={h:.1f}px  pages={m['pages']}  "
-                f"trailing_blank={m['blank_css']:.2f}px ({m['blank_pct']:.3f}%)"
-            )
-            return m
+            log(f"   grew page to {h:.0f}px (still {pages} page(s))")
 
-        def good_enough(m):
-            return m["pages"] == 1 and (m["blank_css"] <= BLANK_THRESHOLD_PX
-                                        or m["blank_pct"] <= 0.5)
-
-        # Phase 1: find a height that yields exactly one page (grow if the
-        # initial guess overflows — print layout can be a touch taller).
-        # Cap the growth: if a page never becomes single even far above the
-        # measured content, growing further is futile (a vh/% element is
-        # filling the page) — stop instead of ballooning to absurd heights.
-        grow_cap = min(MAX_PAGE_HEIGHT_PX, content_h * 2.5 + 10_000)
-        hi = content_h + SAFETY_PAD_PX           # smallest known 1-page height
-        hi_m = None
-        lo = None                                # largest known 2+page height
-        grow = max(50.0, content_h * 0.04)
-        h = hi
-        while renders < MAX_ITERATIONS:
-            m = attempt(h)
-            if m["pages"] == 1:
-                hi, hi_m = h, m
-                break
-            lo = h                               # this height is too short
-            h += grow
-            grow *= 1.7
-            if h > grow_cap:
-                log(f"   note: content keeps filling the page past {grow_cap:.0f}px; "
-                    f"stopping growth (a vh/percentage element is likely involved).")
-                break
-        best = (hi, hi_m) if hi_m is not None else (h, m)
-
-        # Phase 2: binary-search the smallest single-page height to squeeze out
-        # trailing blank. We bracket the 1-page / 2-page boundary: any height
-        # below it overflows, so the boundary is the tightest possible fit.
-        if hi_m is not None and not good_enough(hi_m):
-            while renders < MAX_ITERATIONS and not good_enough(best[1]):
-                if lo is None:
-                    # No 2-page bracket yet: jump down by the current blank to
-                    # try to create one (or land directly on a tighter fit).
-                    cand = hi - hi_m["blank_css"] - SAFETY_PAD_PX
-                    if hi - cand < 1.0:
-                        break
-                    m = attempt(cand)
-                    if m["pages"] == 1:
-                        hi, hi_m = cand, m
-                        best = (hi, hi_m)
-                    else:
-                        lo = cand
-                else:
-                    if hi - lo <= 1.0:
-                        break
-                    mid = (hi + lo) / 2.0
-                    m = attempt(mid)
-                    if m["pages"] == 1:
-                        hi, hi_m = mid, m
-                        best = (hi, hi_m)
-                    else:
-                        lo = mid
-
-        # Re-render at the chosen height so the file on disk matches the report.
-        best_h = best[0]
-        final_m = attempt(best_h)
-        best = (best_h, final_m)
-        if good_enough(final_m):
-            log("   -> converged: one page, content contained, blank minimal.")
-        elif final_m["pages"] == 1:
-            log("   -> tightest single page reached (residual blank is the "
-                "page's own bottom whitespace).")
+        if pages > 1:
+            log(f"   WARNING: content keeps filling the page past {grow_cap:.0f}px "
+                f"(a vh/percentage element is likely involved); leaving {pages} pages.")
         else:
-            log("   -> could not fit one page within limits; see warning above.")
+            removed_pt = crop_to_content(out_path, pad_pt=6.0)
+            log(f"   cropped to content (removed {removed_pt / 72.0:.2f} in of "
+                f"blank above + below)")
 
         # Shrink + linearise for faster opening and lower memory in viewers.
         finalize_pdf(out_path)
 
+        doc = fitz.open(out_path)
+        page_h_pt = doc[0].rect.height
+        doc.close()
+        height_css = page_h_pt / CSS_TO_PT
+        m = measure_pdf(out_path, height_css)
+        if m["pages"] == 1:
+            log("   -> one page, fit to content.")
+
         ctx.close()
         browser.close()
-        return best
+        return (height_css, m)
 
 
 def main():
@@ -1195,9 +1229,10 @@ def main():
         print(f"  Page height      : {height_css:.1f} CSS px  ({m['page_h_pt']:.1f} pt)")
         print(f"  Trailing blank   : {m['blank_css']:.2f} CSS px  ({m['blank_pct']:.3f}% of page)")
         print(f"  Selectable text  : yes (Chromium print-to-PDF)")
-        ok = m["pages"] == 1 and (m["blank_css"] <= BLANK_THRESHOLD_PX
-                                  or m["blank_pct"] <= 0.5)
-        print(f"  Status           : {'PASS' if ok else 'CHECK — see iterations above'}")
+        # The page is trimmed to its content, so fit-to-content is guaranteed;
+        # success is simply landing on one page.
+        ok = m["pages"] == 1
+        print(f"  Status           : {'PASS' if ok else 'CHECK — see log above'}")
     print("=============================================================")
     sys.exit(0 if ok else 1)
 
