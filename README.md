@@ -21,6 +21,9 @@ on-screen styling, colors and layout preserved.
 - Optimizes the output by garbage collecting, recompressing and linearizing so
   it opens faster and uses less memory in viewers, without changing layout or
   text. Linearization uses qpdf or mutool if present
+- Optional font scaling with `--font-scale N` that enlarges text while keeping
+  the page width fixed, so the text reflows larger and reads bigger at fit
+  width. Useful for sites with small type such as deepwiki
 - Optional soft dark mode with `--dark` that flips colors by lightness so
   backgrounds become soft dark and text soft light, keeps hues and images
   intact, leaves already dark pages untouched and keeps text selectable
@@ -43,7 +46,7 @@ playwright install chromium
 ## Usage
 
 ```bash
-python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter]
+python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter] [--font-scale N]
 ```
 
 Example
@@ -62,6 +65,12 @@ Declutter ads and overlays
 
 ```bash
 python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --declutter
+```
+
+Bigger text for small-type sites
+
+```bash
+python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --font-scale 1.4
 ```
 
 Flags can be combined.

@@ -3,7 +3,7 @@
 pageless_pdf.py — Convert any webpage into a single-page PDF.
 
 Usage:
-    python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter]
+    python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter] [--font-scale N]
 
 What it does
 ------------
@@ -165,6 +165,35 @@ FREEZE_JS = """
     }
   }
   return pinned;
+}
+"""
+
+# --- optional font scaling ----------------------------------------------------
+# Enlarge text without widening the page: multiply every element's font-size
+# (and any px line-height) by a factor. Because the page width is unchanged,
+# text reflows taller and ends up larger relative to the page, so it reads
+# bigger at fit-width. Two passes (read all, then apply) so inherited font-size
+# is not scaled twice. Unitless / "normal" line-heights follow the font on their
+# own and are left alone.
+FONT_SCALE_JS = """
+(scale) => {
+  const els = Array.from(document.querySelectorAll('*'));
+  const data = els.map(e => {
+    const cs = getComputedStyle(e);
+    return [e, parseFloat(cs.fontSize), cs.lineHeight];
+  });
+  let n = 0;
+  for (const [e, fs, lh] of data) {
+    if (fs && !isNaN(fs)) {
+      e.style.setProperty('font-size', (fs * scale) + 'px', 'important');
+      if (lh && lh.endsWith('px')) {
+        const v = parseFloat(lh);
+        if (!isNaN(v)) e.style.setProperty('line-height', (v * scale) + 'px', 'important');
+      }
+      n += 1;
+    }
+  }
+  return n;
 }
 """
 
@@ -462,7 +491,7 @@ def finalize_pdf(out_path):
         + (" (linearized)" if linearised else ""))
 
 
-def convert(url, out_path, dark=False, declutter=False):
+def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
     with sync_playwright() as pw:
         # Prefer the full Chromium build if present (headless-shell may be
         # missing); fall back to whatever Playwright resolves by default.
@@ -543,6 +572,14 @@ def convert(url, out_path, dark=False, declutter=False):
                     log(f"        - {s}")
             except Exception as e:
                 log(f"      (declutter note: {e})")
+
+        # Enlarge text before measuring/freezing (it reflows the layout).
+        if font_scale and abs(font_scale - 1.0) > 0.001:
+            try:
+                n = page.evaluate(FONT_SCALE_JS, font_scale)
+                log(f"      font scaled x{font_scale:g} ({n} element(s))")
+            except Exception as e:
+                log(f"      (font-scale note: {e})")
 
         # Freeze viewport-relative elements so the print layout matches the
         # screen (see FREEZE_JS notes). Record screen heights, expose vh sizing
@@ -682,6 +719,28 @@ def main():
             declutter = True
             args.remove(flag)
 
+    # --font-scale N  /  --font-scale=N  /  --font N
+    font_scale = 1.0
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--font-scale", "--font"):
+            if i + 1 < len(args):
+                try:
+                    font_scale = float(args[i + 1])
+                except ValueError:
+                    pass
+                del args[i:i + 2]
+                continue
+        elif a.startswith("--font-scale=") or a.startswith("--font="):
+            try:
+                font_scale = float(a.split("=", 1)[1])
+            except ValueError:
+                pass
+            del args[i]
+            continue
+        i += 1
+
     if not args:
         print(__doc__)
         print("Error: missing <url>", file=sys.stderr)
@@ -691,7 +750,8 @@ def main():
     out_path = args[1] if len(args) > 1 else "output.pdf"
     out_path = os.path.abspath(out_path)
 
-    height_css, m = convert(url, out_path, dark=dark, declutter=declutter)
+    height_css, m = convert(url, out_path, dark=dark, declutter=declutter,
+                            font_scale=font_scale)
 
     page_w_pt = (VIEWPORT_WIDTH) * CSS_TO_PT  # informational
     print("\n=== RESULT ==================================================")
