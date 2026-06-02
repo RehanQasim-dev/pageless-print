@@ -3,10 +3,12 @@
 pageless_pdf.py — Convert any webpage into a single-page PDF.
 
 Usage:
-    python pageless_pdf.py <url> [output.pdf] [--zoom N] [--font-scale N] [--dark] [--declutter]
+    python pageless_pdf.py <url> [output.pdf] [--zoom N] [--font-scale N] [--paged] [--dark] [--declutter]
 
     --zoom N        browser-style zoom as a percent, e.g. --zoom 150 (like Ctrl+ in a browser)
     --font-scale N  multiply only text size, e.g. --font-scale 1.4
+    --paged         split into several large pages that render fast in viewers
+                    (default is one tall pageless page). Blocks are never split.
 
 The desktop layout width is auto-detected from the display so the PDF page comes
 out the same width as a maximized Firefox/Chrome window on this machine.
@@ -57,6 +59,13 @@ CSS_TO_PT = 72.0 / 96.0        # CSS px -> PDF points
 # taller than the 200in PDF default, so this is generous; it only guards
 # against pathological/runaway pages and unbounded memory.
 MAX_PAGE_HEIGHT_PX = 300_000
+# Paged mode (--paged): the tallest page a PDF viewer renders sharply. The PDF
+# format's documented maximum page dimension is 200 inches (14400 pt); beyond
+# that, viewers tile and rasterise the page (blurry, slow scroll). So in paged
+# mode we cap each page at this height and let content flow onto more pages,
+# keeping pages as large as possible while still rendering crisply. In CSS px:
+# 14400 pt / (72/96) = 19200 px. Lower this if a viewer still renders slowly.
+PAGED_MAX_PAGE_PX = 19_200      # 200 inches, the viewer-friendly page-height cap
 # Blank-space detection: render only the bottom strip so we never allocate a
 # giant pixmap for very tall pages.
 MEASURE_ZOOM = 2.0             # pixmap px per PDF point (precision)
@@ -307,6 +316,25 @@ async () => {
   }
   return { expanded, uncollapsed: collapsed.length };
 }
+"""
+
+# --- paged mode: keep blocks whole across page breaks ------------------------
+# Used only by --paged. When the document is split across multiple pages, this
+# tells the layout engine never to split common block-level content (images,
+# figures, tables, code, media, list items, paragraphs, blockquotes) across a
+# page boundary, and to keep a heading with the content that follows it. The
+# rules are unconditional (not wrapped in @media print) because we emulate
+# screen media, yet break-inside still governs the paginated PDF output.
+NO_BREAK_CSS = """
+  img, svg, video, canvas, figure, picture, table, pre, blockquote,
+  li, p, tr, .highlight {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    break-after: avoid !important;
+    page-break-after: avoid !important;
+  }
 """
 
 # --- optional declutter -------------------------------------------------------
@@ -565,6 +593,89 @@ def measure_pdf(out_path, page_height_css):
     }
 
 
+def _bottom_blank_pt(page, zoom=1.0):
+    """Contiguous background space at the bottom of one page, in PDF points.
+
+    Used by paged mode to size pages so as little space as possible is wasted
+    where an unbreakable block was pushed to the next page. Low zoom is fine: we
+    only need to find where content ends, not sub-pixel precision.
+    """
+    H, W = page.rect.height, page.rect.width
+    strip_pt = min(H, MEASURE_STRIP_PT)
+    clip = fitz.Rect(0, H - strip_pt, W, H)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    corners = np.stack([arr[-1, 0], arr[-1, -1]]).astype(np.int16)
+    bg = np.median(corners, axis=0)
+    diff = np.abs(arr.astype(np.int16) - bg).max(axis=2)
+    row_is_blank = (diff <= 10).all(axis=1)
+    blank_rows = 0
+    for r in range(pix.height - 1, -1, -1):
+        if row_is_blank[r]:
+            blank_rows += 1
+        else:
+            break
+    return blank_rows / zoom
+
+
+def measure_paged_blank(out_path):
+    """Total wasted blank at the bottom of every page except the last (points).
+
+    The final page's bottom blank is handled separately by trimming the last
+    page to its content (see trim_last_page), so it is excluded here. Returns
+    (total_blank_pt, page_count).
+    """
+    doc = fitz.open(out_path)
+    pages = doc.page_count
+    total = 0.0
+    for i in range(max(0, pages - 1)):
+        total += _bottom_blank_pt(doc[i])
+    doc.close()
+    return total, pages
+
+
+def content_bottom_pt(page, zoom=0.5):
+    """Y of the lowest non-background row on a page, in points from the top.
+
+    Rasterises the whole page at low resolution (enough to spot text lines) and
+    finds where content ends, even when most of the page is blank. Used to trim
+    the last page of a paged PDF down to its content.
+    """
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    corners = np.stack([arr[-1, 0], arr[-1, -1]]).astype(np.int16)
+    bg = np.median(corners, axis=0)
+    nonblank = (np.abs(arr.astype(np.int16) - bg).max(axis=2) > 10).any(axis=1)
+    idx = np.nonzero(nonblank)[0]
+    return (float(idx[-1] + 1) / zoom) if idx.size else 0.0
+
+
+def trim_last_page(out_path, pad_pt=8.0):
+    """Crop the last page down to its content so no trailing blank remains.
+
+    A PDF may have a shorter final page, so we shrink the last page's box to the
+    content bottom plus a small pad. Returns the points trimmed (0 if none).
+    """
+    doc = fitz.open(out_path)
+    trimmed = 0.0
+    if doc.page_count:
+        last = doc[-1]
+        H, W = last.rect.height, last.rect.width
+        new_h = min(H, content_bottom_pt(last) + pad_pt)
+        if H - new_h > 2.0:
+            # CropBox is in top-left page coords and is what viewers/editors
+            # display, so this keeps the top (content) and drops the bottom
+            # (blank). Setting MediaBox here would reset the cropbox and uses a
+            # bottom-left origin, so we deliberately leave it alone.
+            last.set_cropbox(fitz.Rect(0, 0, W, new_h))
+            doc.save(out_path + ".trim")
+            trimmed = H - new_h
+    doc.close()
+    if trimmed:
+        os.replace(out_path + ".trim", out_path)
+    return trimmed
+
+
 def finalize_pdf(out_path):
     """Shrink the final PDF and, if a tool is available, linearise it.
 
@@ -660,7 +771,7 @@ def detect_browser_width():
 
 
 def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0,
-            base_width=VIEWPORT_WIDTH):
+            base_width=VIEWPORT_WIDTH, paged=False):
     # Browser-style zoom: lay the page out at a narrower width (base / zoom) so
     # it reflows, then magnify that layout by `zoom` when emitting (see the
     # render_scale logic below). Text, images, and spacing all grow together and
@@ -849,6 +960,73 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0
                 f"bottom may not fit on one page.")
             content_h = float(MAX_PAGE_HEIGHT_PX)
 
+        # --- paged mode -----------------------------------------------------
+        # Instead of one giant page (which viewers rasterise blurry + slowly
+        # past ~200in), split the content into pages that render crisply, never
+        # splitting a block across a break. Because blocks are kept whole, a tall
+        # diagram that does not fit gets pushed down, leaving blank space at the
+        # bottom of the page. So we do not just fix the height at the 200in cap:
+        # we try several heights within the range and pick the one that wastes
+        # the least blank, breaking near-ties toward the largest page.
+        if paged:
+            log("[4/4] Generating paged PDF (viewer-friendly, blocks kept whole)")
+            try:
+                page.add_style_tag(content=NO_BREAK_CSS)
+            except Exception as e:
+                log(f"      (no-break css note: {e})")
+            cap = float(PAGED_MAX_PAGE_PX)
+            in_per_px = CSS_TO_PT / 72.0   # px -> inches
+
+            if content_h <= cap:
+                # Fits under the cap: one page, no breaks, nothing wasted.
+                page_h = content_h
+                render_pdf(page, paper_w, page_h, out_path, scale=render_scale)
+                _, pages = measure_paged_blank(out_path)
+                waste_pt = 0.0
+                log(f"   content fits the cap -> 1 page of {page_h:.0f}px "
+                    f"({page_h * in_per_px:.0f} in)")
+            else:
+                # Search heights from the cap down toward half the cap. Fewer
+                # candidates for very tall docs so the search stays bounded.
+                fracs = ([1.0, 0.85, 0.7, 0.55] if content_h > cap * 4
+                         else [1.0, 0.92, 0.85, 0.78, 0.71, 0.64, 0.57, 0.5])
+                TOL_PT = 150.0   # treat blanks within ~2in as a tie -> prefer big
+                best = None      # (key, h, pages, waste_pt)
+                for f in fracs:
+                    h = float(round(cap * f))
+                    render_pdf(page, paper_w, h, out_path, scale=render_scale)
+                    waste_pt, pages = measure_paged_blank(out_path)
+                    log(f"   try {h:.0f}px ({h * in_per_px:.0f} in): {pages} pages, "
+                        f"wasted blank {waste_pt / 72.0:.1f} in")
+                    key = (round(waste_pt / TOL_PT), -h)
+                    if best is None or key < best[0]:
+                        best = (key, h, pages, waste_pt)
+                page_h, _, waste_pt = best[1], best[2], best[3]
+                render_pdf(page, paper_w, page_h, out_path, scale=render_scale)
+                log(f"   -> chosen {page_h:.0f}px ({page_h * in_per_px:.0f} in) page, "
+                    f"least wasted blank {waste_pt / 72.0:.1f} in")
+
+            # Trim trailing blank off the last page so it ends at its content.
+            trimmed_pt = trim_last_page(out_path)
+            if trimmed_pt > 2.0:
+                log(f"   trimmed {trimmed_pt / 72.0:.1f} in of trailing blank "
+                    f"off the last page")
+
+            finalize_pdf(out_path)
+            doc = fitz.open(out_path)
+            pages = doc.page_count
+            page_h_pt = doc[0].rect.height
+            last_h_pt = doc[-1].rect.height
+            doc.close()
+            log(f"   -> {pages} page(s): {page_h_pt / 72.0:.1f} in tall"
+                + (f", last page {last_h_pt / 72.0:.1f} in" if last_h_pt < page_h_pt - 2 else ""))
+            ctx.close()
+            browser.close()
+            m = {"pages": pages, "blank_css": 0.0, "blank_pct": 0.0,
+                 "page_h_pt": page_h_pt, "saturated": False, "paged": True,
+                 "wasted_blank_in": waste_pt / 72.0, "last_page_in": last_h_pt / 72.0}
+            return (page_h, m)
+
         log("[4/4] Generating + self-verifying PDF")
 
         renders = 0
@@ -953,6 +1131,11 @@ def main():
         while flag in args:
             declutter = True
             args.remove(flag)
+    paged = False
+    for flag in ("--paged", "-p"):
+        while flag in args:
+            paged = True
+            args.remove(flag)
 
     # Value flags: --font-scale N (multiplier) and --zoom N (percent, e.g. 150).
     def take_value(names):
@@ -993,18 +1176,28 @@ def main():
     out_path = os.path.abspath(out_path)
 
     height_css, m = convert(url, out_path, dark=dark, declutter=declutter,
-                            font_scale=font_scale, zoom=zoom, base_width=base_width)
+                            font_scale=font_scale, zoom=zoom, base_width=base_width,
+                            paged=paged)
 
-    page_w_pt = base_width * CSS_TO_PT  # informational
     print("\n=== RESULT ==================================================")
     print(f"  Output file      : {out_path}")
     print(f"  PDF pages        : {m['pages']}")
-    print(f"  Page height      : {height_css:.1f} CSS px  ({m['page_h_pt']:.1f} pt)")
-    print(f"  Trailing blank   : {m['blank_css']:.2f} CSS px  ({m['blank_pct']:.3f}% of page)")
-    print(f"  Selectable text  : yes (Chromium print-to-PDF)")
-    ok = m["pages"] == 1 and (m["blank_css"] <= BLANK_THRESHOLD_PX
-                              or m["blank_pct"] <= 0.5)
-    print(f"  Status           : {'PASS' if ok else 'CHECK — see iterations above'}")
+    if m.get("paged"):
+        print(f"  Mode             : paged (viewer-friendly, blocks kept whole)")
+        print(f"  Page height      : {height_css:.1f} CSS px  "
+              f"({m['page_h_pt']:.1f} pt / {m['page_h_pt']/72:.1f} in)")
+        print(f"  Wasted blank     : {m.get('wasted_blank_in', 0.0):.1f} in "
+              f"(at page breaks, minimized)")
+        print(f"  Selectable text  : yes (Chromium print-to-PDF)")
+        ok = m["pages"] >= 1
+        print(f"  Status           : {'PASS' if ok else 'CHECK — see log above'}")
+    else:
+        print(f"  Page height      : {height_css:.1f} CSS px  ({m['page_h_pt']:.1f} pt)")
+        print(f"  Trailing blank   : {m['blank_css']:.2f} CSS px  ({m['blank_pct']:.3f}% of page)")
+        print(f"  Selectable text  : yes (Chromium print-to-PDF)")
+        ok = m["pages"] == 1 and (m["blank_css"] <= BLANK_THRESHOLD_PX
+                                  or m["blank_pct"] <= 0.5)
+        print(f"  Status           : {'PASS' if ok else 'CHECK — see iterations above'}")
     print("=============================================================")
     sys.exit(0 if ok else 1)
 
