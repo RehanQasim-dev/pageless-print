@@ -27,6 +27,8 @@ iteration cap is reached. No human needs to open the PDF.
 import sys
 import os
 import math
+import shutil
+import subprocess
 
 import numpy as np
 import fitz  # PyMuPDF
@@ -417,6 +419,49 @@ def measure_pdf(out_path, page_height_css):
     }
 
 
+def finalize_pdf(out_path):
+    """Shrink the final PDF and, if a tool is available, linearise it.
+
+    This does NOT change page count, layout, or selectable text. It only lowers
+    file size and memory footprint (garbage-collect + recompress) and enables
+    fast-web-view (linearisation) so viewers open and stream it faster. It does
+    not change the per-tile rasterisation cost of a very tall page.
+    """
+    try:
+        before = os.path.getsize(out_path)
+    except OSError:
+        return
+    # Dependency-free: garbage-collect unused objects + recompress streams/fonts.
+    try:
+        doc = fitz.open(out_path)
+        tmp = out_path + ".opt"
+        doc.save(tmp, garbage=4, deflate=True, deflate_fonts=True, clean=True)
+        doc.close()
+        os.replace(tmp, out_path)
+    except Exception as e:
+        log(f"      (finalize note: {e})")
+        return
+    # Optional: linearise for faster first paint, if qpdf or mutool is present.
+    linearised = False
+    qpdf = shutil.which("qpdf")
+    mutool = shutil.which("mutool")
+    try:
+        tmp = out_path + ".lin"
+        if qpdf:
+            subprocess.run([qpdf, "--linearize", out_path, tmp],
+                           check=True, capture_output=True, timeout=180)
+            os.replace(tmp, out_path); linearised = True
+        elif mutool:
+            subprocess.run([mutool, "clean", "-l", out_path, tmp],
+                           check=True, capture_output=True, timeout=180)
+            os.replace(tmp, out_path); linearised = True
+    except Exception:
+        pass  # linearisation is a bonus; ignore if the tool errors
+    after = os.path.getsize(out_path)
+    log(f"      finalized: {before/1e6:.2f} MB -> {after/1e6:.2f} MB"
+        + (" (linearized)" if linearised else ""))
+
+
 def convert(url, out_path, dark=False, declutter=False):
     with sync_playwright() as pw:
         # Prefer the full Chromium build if present (headless-shell may be
@@ -615,6 +660,9 @@ def convert(url, out_path, dark=False, declutter=False):
                 "page's own bottom whitespace).")
         else:
             log("   -> could not fit one page within limits; see warning above.")
+
+        # Shrink + linearise for faster opening and lower memory in viewers.
+        finalize_pdf(out_path)
 
         ctx.close()
         browser.close()

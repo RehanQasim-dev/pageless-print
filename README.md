@@ -18,6 +18,9 @@ on-screen styling, colors and layout preserved.
 - Handles long lazy scroll pages by autoscrolling to trigger lazy content with
   a safety cap so infinite feeds still terminate
 - Renders very tall pages as one tall page with no pagination and no clipping
+- Optimizes the output by garbage collecting, recompressing and linearizing so
+  it opens faster and uses less memory in viewers, without changing layout or
+  text. Linearization uses qpdf or mutool if present
 - Optional soft dark mode with `--dark` that flips colors by lightness so
   backgrounds become soft dark and text soft light, keeps hues and images
   intact, leaves already dark pages untouched and keeps text selectable
