@@ -3,7 +3,13 @@
 pageless_pdf.py — Convert any webpage into a single-page PDF.
 
 Usage:
-    python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter] [--font-scale N]
+    python pageless_pdf.py <url> [output.pdf] [--zoom N] [--font-scale N] [--dark] [--declutter]
+
+    --zoom N        browser-style zoom as a percent, e.g. --zoom 150 (like Ctrl+ in a browser)
+    --font-scale N  multiply only text size, e.g. --font-scale 1.4
+
+The desktop layout width is auto-detected from the display so the PDF page comes
+out the same width as a maximized Firefox/Chrome window on this machine.
 
 What it does
 ------------
@@ -223,6 +229,86 @@ WRAP_CODE_JS = """
 }
 """
 
+# --- always-on: reveal vertically-clipped / collapsed scroll panes -----------
+# Some layouts put real content inside a fixed-height, internally-scrolling pane
+# (e.g. a sticky code panel: 1065px tall on screen but holding an 8576px file you
+# scroll through). A PDF cannot scroll, so only the first viewport-height would
+# print and the rest is lost. We let such panes grow to their full content height
+# so everything is captured — the vertical analogue of WRAP_CODE_JS. This must
+# run BEFORE the freeze pass; otherwise freeze re-clamps these panes to their
+# on-screen height and hides the overflow.
+#
+# Two cases are handled:
+#   Phase 1 (un-collapse): a virtualized pane can collapse to height:0 when it is
+#     never scrolled into view — its row-renderer mounts no rows at zero height,
+#     so it stays empty (chicken-and-egg). We give it a temporary tall height to
+#     force the rows to mount, then release it to its content height. Gated to
+#     panes whose class matches an already-rendered pane, so collapsed menus /
+#     accordions on ordinary pages are left alone.
+#   Phase 2 (expand): panes whose content overflows their visible box grow to
+#     full height. Gated tightly (real text + genuine overflow + not a tiny
+#     widget) so menus, carousels, and empty skeleton panes are untouched.
+EXPAND_SCROLLERS_JS = """
+async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const isScroller = (cs) => cs.overflowY === 'auto' || cs.overflowY === 'scroll';
+  const sig = (e) => (e.className && e.className.toString) ? e.className.toString().trim() : '';
+  const expand = (e) => {
+    e.style.setProperty('height', 'auto', 'important');
+    e.style.setProperty('max-height', 'none', 'important');
+    e.style.setProperty('min-height', '0', 'important');
+    e.style.setProperty('overflow', 'visible', 'important');
+  };
+
+  // Class signatures of scroll panes that DID render real content — used to
+  // recognise a collapsed sibling of the same component (vs an unrelated menu).
+  const renderedSigs = new Set();
+  for (const e of document.querySelectorAll('body *')) {
+    const cs = getComputedStyle(e);
+    if (isScroller(cs) && e.getBoundingClientRect().height >= 150
+        && ((e.textContent || '').length) >= 200) {
+      const s = sig(e); if (s) renderedSigs.add(s);
+    }
+  }
+
+  // Phase 1: un-collapse zero-height virtualized panes of a known content type.
+  const collapsed = [];
+  for (const e of document.querySelectorAll('body *')) {
+    const cs = getComputedStyle(e);
+    if (!isScroller(cs)) continue;
+    if (e.getBoundingClientRect().height >= 30) continue;   // not collapsed
+    if (((e.textContent || '').length) < 200) continue;     // no real content
+    if (!renderedSigs.has(sig(e))) continue;                // not a known pane type
+    collapsed.push(e);
+  }
+  for (const e of collapsed) {
+    e.style.setProperty('height', '3000px', 'important');   // coax rows to mount
+    e.style.setProperty('max-height', 'none', 'important');
+    e.scrollIntoView({ block: 'center' });
+    await sleep(400);
+  }
+  if (collapsed.length) await sleep(500);
+  for (const e of collapsed) expand(e);                     // release to content height
+  window.scrollTo(0, 0);
+  if (collapsed.length) await sleep(300);
+
+  // Phase 2: expand panes whose content overflows their visible box.
+  let expanded = 0;
+  for (const e of document.querySelectorAll('body *')) {
+    const cs = getComputedStyle(e);
+    if (!isScroller(cs)) continue;
+    if (e.scrollHeight <= e.clientHeight + 50) continue;    // not actually clipped
+    if (e.clientHeight < 150) continue;                     // tiny widget -> leave it
+    // textContent, not innerText: off-screen panes render innerText as '' even
+    // though the DOM holds the text.
+    if (((e.textContent || '').length) < 200) continue;     // no real text
+    expand(e);
+    expanded += 1;
+  }
+  return { expanded, uncollapsed: collapsed.length };
+}
+"""
+
 # --- optional declutter -------------------------------------------------------
 # Conservative readability pass (opt-in). Removes things that are clearly not
 # content and that hurt a static single-page PDF: ad iframes/slots, elements
@@ -406,15 +492,20 @@ def log(msg):
     print(msg, flush=True)
 
 
-def render_pdf(page, width_css, height_css, out_path):
-    """Emit a PDF with a single page of exactly width_css x height_css (CSS px)."""
+def render_pdf(page, width_px, height_px, out_path, scale=1.0):
+    """Emit a PDF with a single page of exactly width_px x height_px.
+
+    `scale` magnifies the rendered content (browser-style zoom). The page was
+    laid out at width_px/scale CSS px, so Chromium scaling it by `scale` makes
+    the content fill the paper exactly. Chromium clamps print scale to 0.1-2.0.
+    """
     page.pdf(
         path=out_path,
-        width=f"{width_css}px",
-        height=f"{height_css}px",
+        width=f"{width_px}px",
+        height=f"{height_px}px",
         margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
         print_background=True,
-        scale=1,
+        scale=max(0.1, min(scale, 2.0)),
         prefer_css_page_size=False,
     )
 
@@ -517,7 +608,68 @@ def finalize_pdf(out_path):
         + (" (linearized)" if linearised else ""))
 
 
-def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
+SCROLLBAR_PX = 17  # typical desktop vertical scrollbar; subtracted from screen width
+
+
+def detect_browser_width():
+    """Best-effort desktop layout width (CSS px) matching a maximized browser.
+
+    A maximized Firefox/Chrome lays content out at (screen width - scrollbar).
+    We detect the primary display's width and subtract a typical scrollbar so
+    the captured page comes out the same width as the on-screen browser. Falls
+    back to a common full-HD desktop width when no display can be queried
+    (e.g. a headless server).
+    """
+    import re
+
+    screen_w = None
+
+    # 1) X11 / Linux desktop: parse the active mode (marked with '*') from xrandr.
+    try:
+        out = subprocess.run(["xrandr"], capture_output=True, text=True,
+                             timeout=5).stdout
+        active = [int(m) for m in re.findall(r"(\d+)x\d+\s+[\d.]+\*", out)]
+        if active:
+            screen_w = max(active)
+        else:
+            conn = re.findall(r"connected(?:\s+primary)?\s+(\d+)x\d+", out)
+            if conn:
+                screen_w = max(int(x) for x in conn)
+    except Exception:
+        pass
+
+    # 2) Fallback: ask the windowing toolkit (needs a display, e.g. macOS/X11).
+    if not screen_w:
+        try:
+            import tkinter
+            root = tkinter.Tk()
+            root.withdraw()
+            screen_w = int(root.winfo_screenwidth())
+            root.destroy()
+        except Exception:
+            pass
+
+    if not screen_w or screen_w < 320:
+        log(f"      (could not detect display width; using {VIEWPORT_WIDTH}px)")
+        return VIEWPORT_WIDTH
+
+    width = max(320, screen_w - SCROLLBAR_PX)
+    log(f"      detected display {screen_w}px -> layout width {width}px "
+        f"(matches a maximized browser window)")
+    return width
+
+
+def convert(url, out_path, dark=False, declutter=False, font_scale=1.0, zoom=1.0,
+            base_width=VIEWPORT_WIDTH):
+    # Browser-style zoom: lay the page out at a narrower width (base / zoom) so
+    # it reflows, then magnify that layout by `zoom` when emitting (see the
+    # render_scale logic below). Text, images, and spacing all grow together and
+    # the page keeps the desktop width — exactly like Ctrl+ in Firefox/Chrome.
+    #
+    # `base_width` is the desktop window width to emulate (CSS px). The final PDF
+    # page comes out at this width, so set it to match your browser's window
+    # content width to reproduce exactly what the browser shows at a given zoom.
+    view_w = max(320, round(base_width / zoom)) if zoom and zoom > 0 else base_width
     with sync_playwright() as pw:
         # Prefer the full Chromium build if present (headless-shell may be
         # missing); fall back to whatever Playwright resolves by default.
@@ -533,7 +685,7 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
             pass
         browser = pw.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
-            viewport={"width": VIEWPORT_WIDTH, "height": 1200},
+            viewport={"width": view_w, "height": 1200},
             device_scale_factor=DEVICE_SCALE,
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -543,6 +695,8 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
         page = ctx.new_page()
 
         log(f"[1/4] Loading {url}")
+        if abs(zoom - 1.0) > 0.001:
+            log(f"      zoom {zoom*100:g}% -> layout width {view_w}px")
         page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         for state in ("load", "networkidle"):
             try:
@@ -616,6 +770,20 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
         except Exception as e:
             log(f"      (code-wrap note: {e})")
 
+        # Expand internally-scrolling content panes (e.g. a sticky code panel)
+        # so their full content prints instead of being clipped to one viewport
+        # height. Must run before the freeze pass, which would otherwise re-clamp
+        # them and hide the overflow.
+        try:
+            res = page.evaluate(EXPAND_SCROLLERS_JS) or {}
+            ne, nu = res.get("expanded", 0), res.get("uncollapsed", 0)
+            if nu:
+                log(f"      un-collapsed {nu} zero-height virtualized pane(s)")
+            if ne:
+                log(f"      expanded {ne} internally-scrolling content pane(s)")
+        except Exception as e:
+            log(f"      (expand-scrollers note: {e})")
+
         # Freeze viewport-relative elements so the print layout matches the
         # screen (see FREEZE_JS notes). Record screen heights, expose vh sizing
         # by resizing the viewport tall, pin the changed elements, restore.
@@ -630,10 +798,10 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
             h0 = float(page.evaluate(MEASURE_JS)["height"])
             probe_h = int(max(3500.0, min(h0 + 2000.0, 200_000.0)))
             screen_heights = page.evaluate(TAG_AND_RECORD_JS)
-            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": probe_h})
+            page.set_viewport_size({"width": view_w, "height": probe_h})
             page.wait_for_timeout(400)
             pinned = page.evaluate(FREEZE_JS, screen_heights)
-            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": 1200})
+            page.set_viewport_size({"width": view_w, "height": 1200})
             page.wait_for_timeout(300)
             log(f"      pinned {pinned} viewport-relative element(s) (probe {probe_h}px)")
         except Exception as e:
@@ -654,6 +822,27 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
         content_h = float(dims["height"])
         log(f"      rendered content: {width_css} x {content_h:.1f} CSS px")
 
+        # Browser-style zoom: the page was laid out at the narrowed width
+        # (view_w = base / zoom). Now magnify that reflowed layout by `zoom` when
+        # emitting the PDF, so the page comes out at the desktop width with text,
+        # images, and spacing all grown together — exactly like Ctrl+ in a
+        # browser, not a skinny narrow-column render. Chromium's print scale caps
+        # at 2.0x; beyond that the layout still reflows narrower (text keeps
+        # getting relatively larger) but the magnification itself stops.
+        render_scale = 1.0
+        if zoom and zoom > 0 and abs(zoom - 1.0) > 0.001:
+            render_scale = max(0.1, min(zoom, 2.0))
+            if zoom > 2.0:
+                log(f"      note: magnification capped at 200% (Chromium print "
+                    f"scale limit); layout still reflowed at {view_w}px for "
+                    f"{zoom*100:g}% zoom")
+
+        # From here the height search works in PDF-paper px (= CSS px * scale).
+        paper_w = max(1, round(width_css * render_scale))
+        content_h *= render_scale
+        if abs(render_scale - 1.0) > 0.001:
+            log(f"      magnified x{render_scale:g} -> page {paper_w}px wide")
+
         if content_h > MAX_PAGE_HEIGHT_PX:
             log(f"      WARNING: content height {content_h:.0f}px exceeds Chromium's "
                 f"single-page limit (~{MAX_PAGE_HEIGHT_PX}px). Clamping; the very "
@@ -667,7 +856,7 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
         def attempt(h):
             nonlocal renders
             renders += 1
-            render_pdf(page, width_css, h, out_path)
+            render_pdf(page, paper_w, h, out_path, scale=render_scale)
             m = measure_pdf(out_path, h)
             log(
                 f"   try {renders}: page_height={h:.1f}px  pages={m['pages']}  "
@@ -765,27 +954,34 @@ def main():
             declutter = True
             args.remove(flag)
 
-    # --font-scale N  /  --font-scale=N  /  --font N
-    font_scale = 1.0
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("--font-scale", "--font"):
-            if i + 1 < len(args):
+    # Value flags: --font-scale N (multiplier) and --zoom N (percent, e.g. 150).
+    def take_value(names):
+        i = 0
+        val = None
+        while i < len(args):
+            a = args[i]
+            if a in names:
+                if i + 1 < len(args):
+                    try:
+                        val = float(args[i + 1])
+                    except ValueError:
+                        pass
+                    del args[i:i + 2]
+                    continue
+            elif any(a.startswith(n + "=") for n in names):
                 try:
-                    font_scale = float(args[i + 1])
+                    val = float(a.split("=", 1)[1])
                 except ValueError:
                     pass
-                del args[i:i + 2]
+                del args[i]
                 continue
-        elif a.startswith("--font-scale=") or a.startswith("--font="):
-            try:
-                font_scale = float(a.split("=", 1)[1])
-            except ValueError:
-                pass
-            del args[i]
-            continue
-        i += 1
+            i += 1
+        return val
+
+    font_scale = take_value(("--font-scale", "--font")) or 1.0
+    zoom_pct = take_value(("--zoom", "-z"))
+    zoom = (zoom_pct / 100.0) if zoom_pct else 1.0
+    base_width = detect_browser_width()
 
     if not args:
         print(__doc__)
@@ -797,9 +993,9 @@ def main():
     out_path = os.path.abspath(out_path)
 
     height_css, m = convert(url, out_path, dark=dark, declutter=declutter,
-                            font_scale=font_scale)
+                            font_scale=font_scale, zoom=zoom, base_width=base_width)
 
-    page_w_pt = (VIEWPORT_WIDTH) * CSS_TO_PT  # informational
+    page_w_pt = base_width * CSS_TO_PT  # informational
     print("\n=== RESULT ==================================================")
     print(f"  Output file      : {out_path}")
     print(f"  PDF pages        : {m['pages']}")
