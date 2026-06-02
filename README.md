@@ -18,6 +18,8 @@ on-screen styling, colors and layout preserved.
 - Handles long lazy scroll pages by autoscrolling to trigger lazy content with
   a safety cap so infinite feeds still terminate
 - Renders very tall pages as one tall page with no pagination and no clipping
+- Wraps horizontally scrolling code blocks so long lines are not cut off the
+  right edge, since a PDF cannot scroll sideways
 - Optimizes the output by garbage collecting, recompressing and linearizing so
   it opens faster and uses less memory in viewers, without changing layout or
   text. Linearization uses qpdf or mutool if present

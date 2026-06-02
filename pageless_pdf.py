@@ -197,6 +197,32 @@ FONT_SCALE_JS = """
 }
 """
 
+# --- always-on: reveal horizontally-clipped code -----------------------------
+# Code blocks usually use `white-space: pre` with `overflow-x: auto`, so on a
+# screen you scroll sideways. A PDF cannot scroll, so anything past the right
+# edge is clipped and lost. We make code blocks that actually overflow wrap
+# their long lines instead, so nothing is cut off. Scoped to pre/code-like
+# elements so tables, carousels, and other horizontal scrollers are untouched.
+WRAP_CODE_JS = """
+() => {
+  let n = 0;
+  for (const e of document.querySelectorAll('*')) {
+    const cs = getComputedStyle(e);
+    const ws = cs.whiteSpace;
+    const codey = e.tagName === 'PRE' || e.tagName === 'CODE';
+    // 'pre' (and 'nowrap' on code) are the non-wrapping modes that overflow.
+    if (!(ws === 'pre' || (ws === 'nowrap' && codey))) continue;
+    if (e.scrollWidth > e.clientWidth + 2) {   // actually overflowing to the right
+      e.style.setProperty('white-space', 'pre-wrap', 'important');
+      e.style.setProperty('overflow-wrap', 'anywhere', 'important');
+      e.style.setProperty('word-break', 'break-word', 'important');
+      n += 1;
+    }
+  }
+  return n;
+}
+"""
+
 # --- optional declutter -------------------------------------------------------
 # Conservative readability pass (opt-in). Removes things that are clearly not
 # content and that hurt a static single-page PDF: ad iframes/slots, elements
@@ -580,6 +606,15 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
                 log(f"      font scaled x{font_scale:g} ({n} element(s))")
             except Exception as e:
                 log(f"      (font-scale note: {e})")
+
+        # Wrap horizontally-overflowing code so nothing is clipped off the right
+        # edge (a PDF cannot scroll). Runs before measuring/freezing.
+        try:
+            nw = page.evaluate(WRAP_CODE_JS)
+            if nw:
+                log(f"      wrapped {nw} horizontally-overflowing code block(s)")
+        except Exception as e:
+            log(f"      (code-wrap note: {e})")
 
         # Freeze viewport-relative elements so the print layout matches the
         # screen (see FREEZE_JS notes). Record screen heights, expose vh sizing
