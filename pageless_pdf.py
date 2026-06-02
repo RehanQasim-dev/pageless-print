@@ -3,7 +3,7 @@
 pageless_pdf.py — Convert any webpage into a single-page PDF.
 
 Usage:
-    python pageless_pdf.py <url> [output.pdf] [--dark]
+    python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter]
 
 What it does
 ------------
@@ -166,6 +166,100 @@ FREEZE_JS = """
 }
 """
 
+# --- optional declutter -------------------------------------------------------
+# Conservative readability pass (opt-in). Removes things that are clearly not
+# content and that hurt a static single-page PDF: ad iframes/slots, elements
+# with unambiguous ad signals, and overlay clutter (cookie/consent banners,
+# popups, chat widgets) when they are actually overlay-positioned. Finally it
+# de-floats any remaining fixed/sticky element so nothing hovers over the page.
+# Matching is tight (word boundaries + a curated host list) to avoid nuking real
+# content, and every removal is reported (never silent).
+DECLUTTER_JS = """
+() => {
+  const bodyTextLen = ((document.body && document.body.innerText) || '').length || 1;
+  const samples = [], kept = [];
+  const label = (e) => {
+    let s = e.tagName.toLowerCase();
+    if (e.id) s += '#' + e.id;
+    const cls = (e.className && e.className.toString) ? e.className.toString().trim().split(/\\s+/).filter(Boolean).slice(0, 2).join('.') : '';
+    if (cls) s += '.' + cls;
+    return s.slice(0, 70);
+  };
+  // Safety net: never remove an element holding a big share of the page's text
+  // (guards against a content wrapper that happens to match a keyword).
+  const holdsContent = (e) => {
+    const t = ((e.innerText || '').length);
+    return t > 1500 && t > 0.25 * bodyTextLen;
+  };
+  const kill = (e, why) => {
+    if (!e || !e.parentNode) return false;
+    if (holdsContent(e)) { if (kept.length < 10) kept.push(why + ' KEPT(content) -> ' + label(e)); return false; }
+    if (samples.length < 30) samples.push(why + ' -> ' + label(e));
+    e.parentNode.removeChild(e);
+    return true;
+  };
+
+  const AD_HOSTS = ['doubleclick.net','googlesyndication.com','googleadservices.com',
+    'adservice.google','taboola.com','outbrain.com','adnxs.com','amazon-adsystem.com',
+    'adsafeprotected.com','2mdn.net','criteo','pubmatic','rubiconproject','moatads'];
+  // Strong, unambiguous ad-infrastructure signals only. Deliberately excludes
+  // bare "ad"/"ads"/"sponsor"/"promo"/"banner" to avoid false positives such as
+  // "Remove ads", "Our Sponsors", "header banner", "lead", "download".
+  const reAdStrong = /(^|[-_])(adslot|adunit|adsbygoogle|advert(isement|ising)?|googlead|google-?ads?|dfp|gpt-?ad|ad-(slot|unit|container|wrapper|banner|box|region|rail|placeholder|label|wrap))([-_]|$)/i;
+  // High-confidence consent/cookie terms.
+  const reCookie = /(cookie|consent|gdpr|ccpa|onetrust|truste|cookiebar|cmp-)/i;
+  // Other overlay clutter; only removed when it is a true overlay.
+  const reOverlay = /(newsletter|subscribe|popup|modal|lightbox|backdrop|paywall|interstitial|chat-?widget|intercom|drift|livechat|tawk|zendesk)/i;
+
+  let removed = 0;
+
+  // 1) Ad iframes by host.
+  for (const f of Array.from(document.querySelectorAll('iframe'))) {
+    const src = (f.src || '') + ' ' + (f.getAttribute('data-src') || '');
+    if (AD_HOSTS.some(h => src.indexOf(h) !== -1)) removed += kill(f, 'ad-iframe') ? 1 : 0;
+  }
+
+  // 2) Explicit ad tags / slots (data attributes are unambiguous).
+  for (const e of Array.from(document.querySelectorAll(
+      'ins.adsbygoogle, [data-ad-client], [data-ad-slot], [data-adunit], [data-google-query-id], [data-ad]'))) {
+    removed += kill(e, 'ad-tag') ? 1 : 0;
+  }
+
+  // 3) Ad / overlay-clutter by class / id / aria / role.
+  for (const e of Array.from(document.querySelectorAll('[class], [id], [aria-label]'))) {
+    if (!e.parentNode) continue;
+    const id = e.id || '';
+    const cls = (e.className && e.className.toString) ? e.className.toString() : '';
+    const aria = e.getAttribute('aria-label') || '';
+    const role = e.getAttribute('role') || '';
+    const hay = id + ' ' + cls;
+    const cs = getComputedStyle(e);
+    const z = parseInt(cs.zIndex, 10) || 0;
+    const fixed = cs.position === 'fixed';
+    const dialog = role === 'dialog' || role === 'alertdialog';
+    const overlay = fixed || cs.position === 'sticky' || dialog || z >= 100;
+    let why = null;
+    if (reAdStrong.test(' ' + hay + ' ') || /advertis/i.test(aria)) why = 'ad';
+    else if (reCookie.test(hay) && overlay) why = 'cookie/consent';
+    else if (reOverlay.test(hay) && (fixed || dialog)) why = 'overlay';   // stricter for these
+    if (why) removed += kill(e, why) ? 1 : 0;
+  }
+
+  // 4) De-float only position:fixed elements (they hover at the viewport in a
+  // tall PDF). Sticky already collapses to its in-flow spot when printing, so
+  // we leave it alone to avoid side effects.
+  let defloated = 0;
+  for (const e of Array.from(document.querySelectorAll('body *'))) {
+    if (!e.parentNode) continue;
+    if (getComputedStyle(e).position === 'fixed') {
+      e.style.setProperty('position', 'static', 'important');
+      defloated += 1;
+    }
+  }
+  return { removed, defloated, samples, kept };
+}
+"""
+
 # --- optional soft dark mode --------------------------------------------------
 # Generic dark mode that KEEPS TEXT SELECTABLE. A CSS `filter` on the root would
 # force Chromium to rasterise the whole page (losing real PDF text), so instead
@@ -323,7 +417,7 @@ def measure_pdf(out_path, page_height_css):
     }
 
 
-def convert(url, out_path, dark=False):
+def convert(url, out_path, dark=False, declutter=False):
     with sync_playwright() as pw:
         # Prefer the full Chromium build if present (headless-shell may be
         # missing); fall back to whatever Playwright resolves by default.
@@ -390,6 +484,20 @@ def convert(url, out_path, dark=False):
 
         # Preserve on-screen styling (not Chromium's default print stylesheet).
         page.emulate_media(media="screen")
+
+        # Declutter must run before measuring/freezing since it changes layout.
+        if declutter:
+            log("      Decluttering (ads / overlays / fixed elements)")
+            try:
+                res = page.evaluate(DECLUTTER_JS)
+                log(f"      decluttered: removed {res.get('removed', 0)} element(s), "
+                    f"de-floated {res.get('defloated', 0)} fixed element(s)")
+                for s in res.get("samples", [])[:8]:
+                    log(f"        - {s}")
+                for s in res.get("kept", [])[:5]:
+                    log(f"        - {s}")
+            except Exception as e:
+                log(f"      (declutter note: {e})")
 
         # Freeze viewport-relative elements so the print layout matches the
         # screen (see FREEZE_JS notes). Record screen heights, expose vh sizing
@@ -516,9 +624,14 @@ def convert(url, out_path, dark=False):
 def main():
     args = sys.argv[1:]
     dark = False
+    declutter = False
     for flag in ("--dark", "-d"):
-        if flag in args:
+        while flag in args:
             dark = True
+            args.remove(flag)
+    for flag in ("--declutter", "-c"):
+        while flag in args:
+            declutter = True
             args.remove(flag)
 
     if not args:
@@ -530,7 +643,7 @@ def main():
     out_path = args[1] if len(args) > 1 else "output.pdf"
     out_path = os.path.abspath(out_path)
 
-    height_css, m = convert(url, out_path, dark=dark)
+    height_css, m = convert(url, out_path, dark=dark, declutter=declutter)
 
     page_w_pt = (VIEWPORT_WIDTH) * CSS_TO_PT  # informational
     print("\n=== RESULT ==================================================")

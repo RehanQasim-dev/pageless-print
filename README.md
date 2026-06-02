@@ -21,6 +21,11 @@ on-screen styling, colors and layout preserved.
 - Optional soft dark mode with `--dark` that flips colors by lightness so
   backgrounds become soft dark and text soft light, keeps hues and images
   intact, leaves already dark pages untouched and keeps text selectable
+- Optional cautious declutter with `--declutter` that removes ad iframes and ad
+  slots, removes overlay clutter like cookie banners and popups when they are
+  truly overlay positioned, and de-floats fixed elements so nothing hovers over
+  the page. Matching is tight to avoid false positives, a content element is
+  never removed, and every removal is logged
 - Self verifying. It checks page count and trailing blank in process then
   binary searches the tightest single page height and re renders so the output
   file always matches the reported metrics
@@ -35,7 +40,7 @@ playwright install chromium
 ## Usage
 
 ```bash
-python pageless_pdf.py <url> [output.pdf] [--dark]
+python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter]
 ```
 
 Example
@@ -49,6 +54,14 @@ Soft dark mode
 ```bash
 python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --dark
 ```
+
+Declutter ads and overlays
+
+```bash
+python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --declutter
+```
+
+Flags can be combined.
 
 It prints a verification report when done
 
