@@ -585,19 +585,22 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
         # screen (see FREEZE_JS notes). Record screen heights, expose vh sizing
         # by resizing the viewport tall, pin the changed elements, restore.
         log("[3/4] Freezing viewport-relative elements (vh/% heights)")
-        # Use a fixed, modest probe viewport (never derived from content
-        # height) so a `min-height:100vh` filler can't drive an ever-growing
-        # viewport. A 3500px probe is tall enough to expose vh-sized scroll
-        # containers (they change height) while staying cheap and stable.
-        PROBE_VIEWPORT_H = 3500
+        # The probe viewport must be TALLER than the content, otherwise a
+        # `min-height:100vh` filler that already exceeds the viewport stays
+        # content-driven at both sizes and is never detected (then it balloons
+        # against the paper height when printing). So size the probe to the
+        # content height plus a margin. This is a one-shot measurement, not a
+        # feedback loop, so it cannot run away. Bounded to keep layout cheap.
         try:
+            h0 = float(page.evaluate(MEASURE_JS)["height"])
+            probe_h = int(max(3500.0, min(h0 + 2000.0, 200_000.0)))
             screen_heights = page.evaluate(TAG_AND_RECORD_JS)
-            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": PROBE_VIEWPORT_H})
+            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": probe_h})
             page.wait_for_timeout(400)
             pinned = page.evaluate(FREEZE_JS, screen_heights)
             page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": 1200})
             page.wait_for_timeout(300)
-            log(f"      pinned {pinned} viewport-relative element(s)")
+            log(f"      pinned {pinned} viewport-relative element(s) (probe {probe_h}px)")
         except Exception as e:
             log(f"      (freeze note: {e})")
 
@@ -643,6 +646,10 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
 
         # Phase 1: find a height that yields exactly one page (grow if the
         # initial guess overflows — print layout can be a touch taller).
+        # Cap the growth: if a page never becomes single even far above the
+        # measured content, growing further is futile (a vh/% element is
+        # filling the page) — stop instead of ballooning to absurd heights.
+        grow_cap = min(MAX_PAGE_HEIGHT_PX, content_h * 2.5 + 10_000)
         hi = content_h + SAFETY_PAD_PX           # smallest known 1-page height
         hi_m = None
         lo = None                                # largest known 2+page height
@@ -656,6 +663,10 @@ def convert(url, out_path, dark=False, declutter=False, font_scale=1.0):
             lo = h                               # this height is too short
             h += grow
             grow *= 1.7
+            if h > grow_cap:
+                log(f"   note: content keeps filling the page past {grow_cap:.0f}px; "
+                    f"stopping growth (a vh/percentage element is likely involved).")
+                break
         best = (hi, hi_m) if hi_m is not None else (h, m)
 
         # Phase 2: binary-search the smallest single-page height to squeeze out
