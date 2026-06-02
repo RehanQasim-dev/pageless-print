@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+pageless_pdf.py — Convert any webpage into a single-page PDF.
+
+Usage:
+    python pageless_pdf.py <url> [output.pdf]
+
+What it does
+------------
+Renders a webpage in a real (headless Chromium) browser at desktop width,
+triggers lazy-loaded / JS-rendered content by scrolling, measures the full
+rendered content size, then emits a PDF whose single page is sized to fit the
+entire page exactly. The PDF contains real, selectable text (Chromium's
+print-to-PDF, not a screenshot) and preserves screen styling/colors/layout.
+
+Self-correction
+---------------
+After generating the PDF the script verifies its own output entirely in-process
+using PyMuPDF:
+  * the PDF must have exactly ONE page,
+  * the content must be fully contained (no clipping / no overflow page),
+  * trailing blank space at the bottom must be below a small threshold.
+It iterates, shrinking/growing the page height, until those hold or a max
+iteration cap is reached. No human needs to open the PDF.
+"""
+
+import sys
+import os
+import math
+
+import numpy as np
+import fitz  # PyMuPDF
+from playwright.sync_api import sync_playwright
+
+# ---- tunables ---------------------------------------------------------------
+VIEWPORT_WIDTH = 1440          # desktop layout width (CSS px)
+DEVICE_SCALE = 1
+MAX_ITERATIONS = 14
+BLANK_THRESHOLD_PX = 4.0       # acceptable trailing blank space (CSS px)
+SAFETY_PAD_PX = 1.0            # tiny pad to avoid sub-pixel overflow -> 2nd page
+NAV_TIMEOUT_MS = 60_000
+# Post-load settle: wait until content height is stable for N samples (or a
+# timeout), so late JS-rendered / streamed content is captured.
+STABILIZE_INTERVAL_MS = 500
+STABILIZE_TIMEOUT_MS = 12_000
+STABLE_SAMPLES = 3
+CSS_TO_PT = 72.0 / 96.0        # CSS px -> PDF points
+# Upper bound on a single page's height (CSS px). Chromium can emit pages far
+# taller than the 200in PDF default, so this is generous; it only guards
+# against pathological/runaway pages and unbounded memory.
+MAX_PAGE_HEIGHT_PX = 300_000
+# Blank-space detection: render only the bottom strip so we never allocate a
+# giant pixmap for very tall pages.
+MEASURE_ZOOM = 2.0             # pixmap px per PDF point (precision)
+MEASURE_STRIP_PT = 3000.0      # how much of the page bottom to rasterise
+# -----------------------------------------------------------------------------
+
+
+# JS that scrolls the whole document to force lazy-loaded content to appear,
+# then returns once the scroll height has stabilised.
+AUTOSCROLL_JS = """
+async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const docH = () => Math.max(
+    document.body ? document.body.scrollHeight : 0,
+    document.documentElement.scrollHeight
+  );
+  const vp = window.innerHeight || 1000;
+  const start = docH();
+  // Runaway guard: some pages append content endlessly while scrolling
+  // (infinite feeds). Stop if the document blows past a sane multiple.
+  const runawayCap = Math.max(start * 6, 30000);
+
+  // Pass 1: progressive scroll, one ~viewport at a time, letting
+  // viewport-triggered lazy content load. Bounded number of steps.
+  let y = 0, guard = 0;
+  while (y < docH() - vp && guard < 80) {
+    y += Math.floor(vp * 0.85);
+    window.scrollTo(0, y);
+    await sleep(150);
+    guard += 1;
+    if (docH() > runawayCap) break;
+  }
+
+  // Pass 2: settle — wait for height to stabilise, but only a few gentle
+  // checks so we don't keep poking an infinite feed.
+  let last = -1, stable = 0, g2 = 0;
+  while (stable < 2 && g2 < 12) {
+    const h = docH();
+    window.scrollTo(0, h);
+    await sleep(200);
+    if (docH() === last) { stable += 1; } else { stable = 0; }
+    last = docH();
+    g2 += 1;
+    if (docH() > runawayCap) break;
+  }
+  window.scrollTo(0, 0);
+  await sleep(150);
+}
+"""
+
+# Returns the full rendered content box of the document (CSS px).
+MEASURE_JS = """
+() => {
+  const de = document.documentElement;
+  const body = document.body;
+  const width = Math.max(
+    de.scrollWidth, de.offsetWidth, de.clientWidth,
+    body ? body.scrollWidth : 0, body ? body.offsetWidth : 0
+  );
+  const height = Math.max(
+    de.scrollHeight, de.offsetHeight, de.clientHeight,
+    body ? body.scrollHeight : 0, body ? body.offsetHeight : 0
+  );
+  return { width, height };
+}
+"""
+
+# --- viewport-unit freezing ---------------------------------------------------
+# Chromium's print-to-PDF resolves viewport units (vh/vw) and percentage
+# heights against the *paper* size, not the on-screen viewport. On pages with
+# vh-sized scroll containers (sticky sidebars, TOCs, capped code blocks) this
+# makes the print layout balloon — often 2x+ taller — and breaks single-page
+# fitting. We neutralise it generically (no per-site selectors): tag every
+# element and record its on-screen height, resize the viewport tall so vh
+# resolves large (as it will on the tall paper), then pin every element whose
+# height changed back to its on-screen pixel height. The print layout then
+# matches what a desktop browser shows.
+
+# Tag each element and capture its current (on-screen) rendered height.
+TAG_AND_RECORD_JS = """
+() => {
+  let i = 0; const rec = {};
+  for (const e of document.querySelectorAll('body, body *')) {
+    e.setAttribute('data-ppf', i);
+    rec[i] = Math.round(e.getBoundingClientRect().height);
+    i += 1;
+  }
+  return rec;
+}
+"""
+
+# After the viewport has been resized tall, pin every element whose height
+# changed (i.e. it was viewport-relative) back to its recorded on-screen height.
+FREEZE_JS = """
+(screen) => {
+  let pinned = 0;
+  for (const e of document.querySelectorAll('[data-ppf]')) {
+    const i = e.getAttribute('data-ppf');
+    const h0 = screen[i];
+    if (h0 == null) continue;
+    const h1 = Math.round(e.getBoundingClientRect().height);
+    if (Math.abs(h1 - h0) > 4) {            // viewport-dependent element
+      const cs = getComputedStyle(e);
+      e.style.setProperty('height', h0 + 'px', 'important');
+      e.style.setProperty('min-height', h0 + 'px', 'important');
+      e.style.setProperty('max-height', h0 + 'px', 'important');
+      const ov = cs.overflowY;
+      if (ov === 'auto' || ov === 'scroll' || ov === 'visible') {
+        e.style.setProperty('overflow', 'hidden', 'important');  // keep it clipped, as on screen
+      }
+      pinned += 1;
+    }
+  }
+  return pinned;
+}
+"""
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def render_pdf(page, width_css, height_css, out_path):
+    """Emit a PDF with a single page of exactly width_css x height_css (CSS px)."""
+    page.pdf(
+        path=out_path,
+        width=f"{width_css}px",
+        height=f"{height_css}px",
+        margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
+        print_background=True,
+        scale=1,
+        prefer_css_page_size=False,
+    )
+
+
+def measure_pdf(out_path, page_height_css):
+    """
+    Inspect the produced PDF *in process* (no human reading required).
+
+    Returns dict:
+      pages        : number of PDF pages
+      blank_css    : trailing blank space at bottom of page 1, in CSS px
+      blank_pct    : that blank space as % of page height
+      page_h_pt    : page-1 height in PDF points
+    """
+    doc = fitz.open(out_path)
+    pages = doc.page_count
+    page = doc[0]
+    page_w_pt = page.rect.width
+    page_h_pt = page.rect.height
+
+    # Rasterise only the bottom strip -> bounded memory even for very tall pages.
+    strip_pt = min(page_h_pt, MEASURE_STRIP_PT)
+    clip = fitz.Rect(0, page_h_pt - strip_pt, page_w_pt, page_h_pt)
+    pix = page.get_pixmap(matrix=fitz.Matrix(MEASURE_ZOOM, MEASURE_ZOOM),
+                          clip=clip, alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    doc.close()
+
+    # Background reference = median of the two BOTTOM corners. The very bottom
+    # corners are almost always page background, so a coloured footer bar (a
+    # different colour) is correctly treated as content, not as blank space.
+    corners = np.stack([arr[-1, 0], arr[-1, -1]]).astype(np.int16)
+    bg = np.median(corners, axis=0)
+
+    tol = 10  # per-channel colour tolerance
+    diff = np.abs(arr.astype(np.int16) - bg).max(axis=2)
+    row_is_blank = (diff <= tol).all(axis=1)  # row is blank iff every px ~= bg
+
+    # Count contiguous blank rows from the bottom upward.
+    blank_rows = 0
+    for r in range(pix.height - 1, -1, -1):
+        if row_is_blank[r]:
+            blank_rows += 1
+        else:
+            break
+
+    blank_pt = blank_rows / MEASURE_ZOOM           # pixmap px -> PDF points
+    blank_css = blank_pt / CSS_TO_PT               # points -> CSS px
+    saturated = blank_rows == pix.height           # blank filled the whole strip
+    blank_pct = (blank_css / page_height_css) * 100.0 if page_height_css else 0.0
+    return {
+        "pages": pages,
+        "blank_css": blank_css,
+        "blank_pct": blank_pct,
+        "page_h_pt": page_h_pt,
+        "saturated": saturated,
+    }
+
+
+def convert(url, out_path):
+    with sync_playwright() as pw:
+        # Prefer the full Chromium build if present (headless-shell may be
+        # missing); fall back to whatever Playwright resolves by default.
+        launch_kwargs = dict(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
+        )
+        try:
+            exe = pw.chromium.executable_path
+            if exe and os.path.exists(exe):
+                launch_kwargs["executable_path"] = exe
+        except Exception:
+            pass
+        browser = pw.chromium.launch(**launch_kwargs)
+        ctx = browser.new_context(
+            viewport={"width": VIEWPORT_WIDTH, "height": 1200},
+            device_scale_factor=DEVICE_SCALE,
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+        )
+        page = ctx.new_page()
+
+        log(f"[1/4] Loading {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        for state in ("load", "networkidle"):
+            try:
+                page.wait_for_load_state(state, timeout=NAV_TIMEOUT_MS)
+            except Exception:
+                pass  # some pages never go fully idle (polling, analytics) — proceed
+
+        log("[2/4] Scrolling to trigger lazy-loaded / JS content")
+        try:
+            page.evaluate(AUTOSCROLL_JS)
+        except Exception as e:
+            log(f"      (autoscroll note: {e})")
+        try:
+            page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+
+        # Wait for the page to actually settle: web fonts finished loading and
+        # the content height stable for a few consecutive samples. This catches
+        # JS that renders/streams content after the network goes idle.
+        try:
+            page.evaluate("() => document.fonts ? document.fonts.ready : null")
+        except Exception:
+            pass
+        last_h, stable, waited = -1, 0, 0
+        while stable < STABLE_SAMPLES and waited < STABILIZE_TIMEOUT_MS:
+            try:
+                h = page.evaluate(
+                    "() => Math.max(document.body ? document.body.scrollHeight : 0,"
+                    " document.documentElement.scrollHeight)"
+                )
+            except Exception:
+                break
+            stable = stable + 1 if h == last_h else 0
+            last_h = h
+            page.wait_for_timeout(STABILIZE_INTERVAL_MS)
+            waited += STABILIZE_INTERVAL_MS
+        log(f"      content settled at {last_h}px")
+
+        # Preserve on-screen styling (not Chromium's default print stylesheet).
+        page.emulate_media(media="screen")
+
+        # Freeze viewport-relative elements so the print layout matches the
+        # screen (see FREEZE_JS notes). Record screen heights, expose vh sizing
+        # by resizing the viewport tall, pin the changed elements, restore.
+        log("[3/4] Freezing viewport-relative elements (vh/% heights)")
+        # Use a fixed, modest probe viewport (never derived from content
+        # height) so a `min-height:100vh` filler can't drive an ever-growing
+        # viewport. A 3500px probe is tall enough to expose vh-sized scroll
+        # containers (they change height) while staying cheap and stable.
+        PROBE_VIEWPORT_H = 3500
+        try:
+            screen_heights = page.evaluate(TAG_AND_RECORD_JS)
+            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": PROBE_VIEWPORT_H})
+            page.wait_for_timeout(400)
+            pinned = page.evaluate(FREEZE_JS, screen_heights)
+            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": 1200})
+            page.wait_for_timeout(300)
+            log(f"      pinned {pinned} viewport-relative element(s)")
+        except Exception as e:
+            log(f"      (freeze note: {e})")
+
+        dims = page.evaluate(MEASURE_JS)
+        width_css = math.ceil(dims["width"])
+        content_h = float(dims["height"])
+        log(f"      rendered content: {width_css} x {content_h:.1f} CSS px")
+
+        if content_h > MAX_PAGE_HEIGHT_PX:
+            log(f"      WARNING: content height {content_h:.0f}px exceeds Chromium's "
+                f"single-page limit (~{MAX_PAGE_HEIGHT_PX}px). Clamping; the very "
+                f"bottom may not fit on one page.")
+            content_h = float(MAX_PAGE_HEIGHT_PX)
+
+        log("[4/4] Generating + self-verifying PDF")
+
+        renders = 0
+
+        def attempt(h):
+            nonlocal renders
+            renders += 1
+            render_pdf(page, width_css, h, out_path)
+            m = measure_pdf(out_path, h)
+            log(
+                f"   try {renders}: page_height={h:.1f}px  pages={m['pages']}  "
+                f"trailing_blank={m['blank_css']:.2f}px ({m['blank_pct']:.3f}%)"
+            )
+            return m
+
+        def good_enough(m):
+            return m["pages"] == 1 and (m["blank_css"] <= BLANK_THRESHOLD_PX
+                                        or m["blank_pct"] <= 0.5)
+
+        # Phase 1: find a height that yields exactly one page (grow if the
+        # initial guess overflows — print layout can be a touch taller).
+        hi = content_h + SAFETY_PAD_PX           # smallest known 1-page height
+        hi_m = None
+        lo = None                                # largest known 2+page height
+        grow = max(50.0, content_h * 0.04)
+        h = hi
+        while renders < MAX_ITERATIONS:
+            m = attempt(h)
+            if m["pages"] == 1:
+                hi, hi_m = h, m
+                break
+            lo = h                               # this height is too short
+            h += grow
+            grow *= 1.7
+        best = (hi, hi_m) if hi_m is not None else (h, m)
+
+        # Phase 2: binary-search the smallest single-page height to squeeze out
+        # trailing blank. We bracket the 1-page / 2-page boundary: any height
+        # below it overflows, so the boundary is the tightest possible fit.
+        if hi_m is not None and not good_enough(hi_m):
+            while renders < MAX_ITERATIONS and not good_enough(best[1]):
+                if lo is None:
+                    # No 2-page bracket yet: jump down by the current blank to
+                    # try to create one (or land directly on a tighter fit).
+                    cand = hi - hi_m["blank_css"] - SAFETY_PAD_PX
+                    if hi - cand < 1.0:
+                        break
+                    m = attempt(cand)
+                    if m["pages"] == 1:
+                        hi, hi_m = cand, m
+                        best = (hi, hi_m)
+                    else:
+                        lo = cand
+                else:
+                    if hi - lo <= 1.0:
+                        break
+                    mid = (hi + lo) / 2.0
+                    m = attempt(mid)
+                    if m["pages"] == 1:
+                        hi, hi_m = mid, m
+                        best = (hi, hi_m)
+                    else:
+                        lo = mid
+
+        # Re-render at the chosen height so the file on disk matches the report.
+        best_h = best[0]
+        final_m = attempt(best_h)
+        best = (best_h, final_m)
+        if good_enough(final_m):
+            log("   -> converged: one page, content contained, blank minimal.")
+        elif final_m["pages"] == 1:
+            log("   -> tightest single page reached (residual blank is the "
+                "page's own bottom whitespace).")
+        else:
+            log("   -> could not fit one page within limits; see warning above.")
+
+        ctx.close()
+        browser.close()
+        return best
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("Error: missing <url>", file=sys.stderr)
+        sys.exit(2)
+
+    url = sys.argv[1]
+    out_path = sys.argv[2] if len(sys.argv) > 2 else "output.pdf"
+    out_path = os.path.abspath(out_path)
+
+    height_css, m = convert(url, out_path)
+
+    page_w_pt = (VIEWPORT_WIDTH) * CSS_TO_PT  # informational
+    print("\n=== RESULT ==================================================")
+    print(f"  Output file      : {out_path}")
+    print(f"  PDF pages        : {m['pages']}")
+    print(f"  Page height      : {height_css:.1f} CSS px  ({m['page_h_pt']:.1f} pt)")
+    print(f"  Trailing blank   : {m['blank_css']:.2f} CSS px  ({m['blank_pct']:.3f}% of page)")
+    print(f"  Selectable text  : yes (Chromium print-to-PDF)")
+    ok = m["pages"] == 1 and (m["blank_css"] <= BLANK_THRESHOLD_PX
+                              or m["blank_pct"] <= 0.5)
+    print(f"  Status           : {'PASS' if ok else 'CHECK — see iterations above'}")
+    print("=============================================================")
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
