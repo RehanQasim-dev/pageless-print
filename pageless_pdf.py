@@ -3,7 +3,7 @@
 pageless_pdf.py — Convert any webpage into a single-page PDF.
 
 Usage:
-    python pageless_pdf.py <url> [output.pdf]
+    python pageless_pdf.py <url> [output.pdf] [--dark]
 
 What it does
 ------------
@@ -166,6 +166,90 @@ FREEZE_JS = """
 }
 """
 
+# --- optional soft dark mode --------------------------------------------------
+# Generic dark mode that KEEPS TEXT SELECTABLE. A CSS `filter` on the root would
+# force Chromium to rasterise the whole page (losing real PDF text), so instead
+# we recolour each element's actual colour properties: flip every colour's
+# *lightness* (in HSL) while preserving hue and saturation, softly (so light
+# backgrounds become ~#1e1e1e and dark text becomes ~#e6e6e6, never pure
+# black/white). Images/videos are left untouched. Already-dark pages are
+# skipped. Because only colours change (not `filter`), text stays selectable.
+DARK_JS = """
+() => {
+  const parse = (c) => {
+    const m = c && c.match(/rgba?\\(([^)]+)\\)/);
+    if (!m) return null;
+    const p = m[1].split(',').map(s => parseFloat(s.trim()));
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  };
+  const rgb2hsl = (r, g, b) => {
+    r/=255; g/=255; b/=255;
+    const mx=Math.max(r,g,b), mn=Math.min(r,g,b); let h=0,s=0,l=(mx+mn)/2;
+    if (mx!==mn){ const d=mx-mn; s=l>0.5?d/(2-mx-mn):d/(mx+mn);
+      if (mx===r) h=(g-b)/d+(g<b?6:0); else if (mx===g) h=(b-r)/d+2; else h=(r-g)/d+4; h/=6; }
+    return [h,s,l];
+  };
+  const hue2 = (p,q,t) => { if(t<0)t+=1; if(t>1)t-=1;
+    if(t<1/6)return p+(q-p)*6*t; if(t<1/2)return q; if(t<2/3)return p+(q-p)*(2/3-t)*6; return p; };
+  const hsl2rgb = (h,s,l) => {
+    let r,g,b;
+    if (s===0){ r=g=b=l; } else { const q=l<0.5?l*(1+s):l+s-l*s, p=2*l-q;
+      r=hue2(p,q,h+1/3); g=hue2(p,q,h); b=hue2(p,q,h-1/3); }
+    return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+  };
+  // Soft lightness flip: L -> 0.92 - 0.84*L  (white 1->0.08, black 0->0.92).
+  const flip = (c) => {
+    const [h,s,l] = rgb2hsl(c.r,c.g,c.b);
+    const nl = 0.92 - 0.84*l;
+    const [r,g,b] = hsl2rgb(h,s,nl);
+    return `rgba(${r}, ${g}, ${b}, ${c.a})`;
+  };
+
+  // Skip pages that are already dark.
+  const bodyBg = parse(getComputedStyle(document.body || document.documentElement).backgroundColor);
+  if (bodyBg && bodyBg.a > 0.1) {
+    const lum = (0.2126*bodyBg.r + 0.7152*bodyBg.g + 0.0722*bodyBg.b)/255;
+    if (lum < 0.35) return { applied: false, reason: 'page already dark' };
+  }
+
+  // Pass 1: read every element's ORIGINAL colours before mutating anything.
+  // (Reading after writing would double-flip inherited properties like `color`.)
+  const els = Array.from(document.querySelectorAll('*'));
+  const sides = ['Top','Right','Bottom','Left'];
+  const plan = els.map((e) => {
+    const cs = getComputedStyle(e);
+    const bg = parse(cs.backgroundColor);
+    const col = parse(cs.color);
+    const borders = sides.map(s => parse(cs['border'+s+'Color']));
+    return { e, bg, col, borders };
+  });
+
+  // Pass 2: apply the flipped colours.
+  let n = 0;
+  for (const pl of plan) {
+    const { e, bg, col, borders } = pl;
+    if (bg && bg.a > 0.05) e.style.setProperty('background-color', flip(bg), 'important');
+    if (col && col.a > 0.05) e.style.setProperty('color', flip(col), 'important');
+    borders.forEach((bc, i) => {
+      if (bc && bc.a > 0.05)
+        e.style.setProperty('border-'+sides[i].toLowerCase()+'-color', flip(bc), 'important');
+    });
+    n += 1;
+  }
+
+  // Dark fallback for transparent roots (so gaps/paper show dark, not white).
+  const rootBg = parse(getComputedStyle(document.documentElement).backgroundColor);
+  if (!rootBg || rootBg.a < 0.05)
+    document.documentElement.style.setProperty('background-color', '#1a1a1a', 'important');
+  if (document.body) {
+    const bb = parse(getComputedStyle(document.body).backgroundColor);
+    if (!bb || bb.a < 0.05)
+      document.body.style.setProperty('background-color', '#1a1a1a', 'important');
+  }
+  return { applied: true, recolored: n };
+}
+"""
+
 
 def log(msg):
     print(msg, flush=True)
@@ -239,7 +323,7 @@ def measure_pdf(out_path, page_height_css):
     }
 
 
-def convert(url, out_path):
+def convert(url, out_path, dark=False):
     with sync_playwright() as pw:
         # Prefer the full Chromium build if present (headless-shell may be
         # missing); fall back to whatever Playwright resolves by default.
@@ -326,6 +410,16 @@ def convert(url, out_path):
             log(f"      pinned {pinned} viewport-relative element(s)")
         except Exception as e:
             log(f"      (freeze note: {e})")
+
+        if dark:
+            try:
+                res = page.evaluate(DARK_JS)
+                if res.get("applied"):
+                    log(f"      dark mode applied (recoloured {res.get('recolored', 0)} element(s))")
+                else:
+                    log(f"      dark mode skipped: {res.get('reason', 'n/a')}")
+            except Exception as e:
+                log(f"      (dark mode note: {e})")
 
         dims = page.evaluate(MEASURE_JS)
         width_css = math.ceil(dims["width"])
@@ -420,16 +514,23 @@ def convert(url, out_path):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    dark = False
+    for flag in ("--dark", "-d"):
+        if flag in args:
+            dark = True
+            args.remove(flag)
+
+    if not args:
         print(__doc__)
         print("Error: missing <url>", file=sys.stderr)
         sys.exit(2)
 
-    url = sys.argv[1]
-    out_path = sys.argv[2] if len(sys.argv) > 2 else "output.pdf"
+    url = args[0]
+    out_path = args[1] if len(args) > 1 else "output.pdf"
     out_path = os.path.abspath(out_path)
 
-    height_css, m = convert(url, out_path)
+    height_css, m = convert(url, out_path, dark=dark)
 
     page_w_pt = (VIEWPORT_WIDTH) * CSS_TO_PT  # informational
     print("\n=== RESULT ==================================================")

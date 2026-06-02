@@ -18,6 +18,9 @@ on-screen styling, colors and layout preserved.
 - Handles long lazy scroll pages by autoscrolling to trigger lazy content with
   a safety cap so infinite feeds still terminate
 - Renders very tall pages as one tall page with no pagination and no clipping
+- Optional soft dark mode with `--dark` that flips colors by lightness so
+  backgrounds become soft dark and text soft light, keeps hues and images
+  intact, leaves already dark pages untouched and keeps text selectable
 - Self verifying. It checks page count and trailing blank in process then
   binary searches the tightest single page height and re renders so the output
   file always matches the reported metrics
@@ -32,13 +35,19 @@ playwright install chromium
 ## Usage
 
 ```bash
-python pageless_pdf.py <url> [output.pdf]
+python pageless_pdf.py <url> [output.pdf] [--dark]
 ```
 
 Example
 
 ```bash
 python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf
+```
+
+Soft dark mode
+
+```bash
+python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --dark
 ```
 
 It prints a verification report when done
