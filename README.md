@@ -10,7 +10,8 @@ on-screen styling, colors and layout preserved.
   trailing blank space
 - Real selectable PDF text not an image
 - Preserves desktop styling, layout and colors by rendering at desktop width so
-  responsive media query layouts resolve to their desktop view
+  responsive media query layouts resolve to their desktop view. The width is
+  auto-detected from the display so the page matches a maximized browser window
 - Corrects viewport units (vh and percent) by pinning viewport relative
   elements to their on-screen size so the print layout matches the screen
 - Supports dynamic content and lazy image loading by running real Chromium and
@@ -20,12 +21,18 @@ on-screen styling, colors and layout preserved.
 - Renders very tall pages as one tall page with no pagination and no clipping
 - Wraps horizontally scrolling code blocks so long lines are not cut off the
   right edge, since a PDF cannot scroll sideways
+- Reveals content trapped in internally scrolling panes such as sticky code
+  panels by expanding them to full height, and un-collapses zero height
+  virtualized panes that never mounted, so nothing is clipped vertically
 - Optimizes the output by garbage collecting, recompressing and linearizing so
   it opens faster and uses less memory in viewers, without changing layout or
   text. Linearization uses qpdf or mutool if present
-- Optional font scaling with `--font-scale N` that enlarges text while keeping
-  the page width fixed, so the text reflows larger and reads bigger at fit
-  width. Useful for sites with small type such as deepwiki
+- Optional browser style zoom with `--zoom N` as a percent like `--zoom 150`
+  that reflows and magnifies the page just like Ctrl plus in a browser, while
+  keeping the page at the desktop width
+- Optional font scaling with `--font-scale N` that enlarges only text while
+  keeping the page width fixed, so the text reflows larger and reads bigger at
+  fit width. Useful for sites with small type such as deepwiki
 - Optional soft dark mode with `--dark` that flips colors by lightness so
   backgrounds become soft dark and text soft light, keeps hues and images
   intact, leaves already dark pages untouched and keeps text selectable
@@ -48,7 +55,7 @@ playwright install chromium
 ## Usage
 
 ```bash
-python pageless_pdf.py <url> [output.pdf] [--dark] [--declutter] [--font-scale N]
+python pageless_pdf.py <url> [output.pdf] [--zoom N] [--font-scale N] [--dark] [--declutter]
 ```
 
 Example
@@ -67,6 +74,12 @@ Declutter ads and overlays
 
 ```bash
 python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --declutter
+```
+
+Browser style zoom
+
+```bash
+python pageless_pdf.py https://en.wikipedia.org/wiki/PDF out.pdf --zoom 150
 ```
 
 Bigger text for small-type sites
